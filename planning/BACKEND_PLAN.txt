@@ -1,0 +1,1220 @@
+================================================================================
+NAMMAKELSA — BACKEND SERVICE: COMPLETE SYSTEM DESIGN PLAN
+================================================================================
+Project      : NammaKelsa — Blue Collar / Polytechnic Job Readiness Platform
+Service      : backend (standalone FastAPI microservice)
+Author       : Anurag Chaurasia
+Last Updated : 2026-05-03
+ML Service Plan : ML_SERVICE_PLAN.txt (same directory)
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1.  Purpose & Scope
+2.  Full User Journey
+3.  Tech Stack
+4.  System Architecture
+5.  Database Schema (PostgreSQL — backend DB, separate from ML DB)
+6.  Redis Caching Strategy
+7.  Kafka — What Backend Produces
+8.  Chatbot Integration (low_latency_chat_bot)
+9.  System Prompt Design for Groq (per skill)
+10. Workexp Video Chunked Upload Flow
+11. Interview Video/Audio Flow
+12. ML Service Integration
+13. OTP Auth Flow (Twilio)
+14. Attempt & Cooldown Logic
+15. Admin Dashboard
+16. API Endpoints
+17. Folder Structure
+18. Environment Variables
+19. Build Order
+20. Key Design Decisions & Rationale
+
+
+================================================================================
+1. PURPOSE & SCOPE
+================================================================================
+
+The backend is the central orchestrator of NammaKelsa. It owns:
+  - User registration (phone OTP + face + Aadhaar)
+  - Skill selection and attempt/cooldown enforcement
+  - Document uploads (degree image, workexp video)
+  - Chatbot interview session (audio + video)
+  - Sending media to ML service via Kafka
+  - Polling ML service for verdict
+  - Serving results to frontend (NextJS PWA)
+  - Admin dashboard APIs for officers
+
+The backend does NOT own ML inference. It sends data to ML service and
+reads results back via HTTP GET /verdict/{candidate_id}.
+
+
+================================================================================
+2. FULL USER JOURNEY
+================================================================================
+
+Step 1 — OTP Verification
+  User opens PWA → enters phone number
+  Backend sends OTP via Twilio → user verifies
+  JWT issued with is_registered=false (partial token for next steps only)
+
+Step 2 — Face Registration (separate step after OTP)
+  User records a short 3-5 second video of their face
+  Backend extracts the best single frame (sharpest face detected using OpenCV)
+  Calls ML service POST /face-check:
+    ML extracts ArcFace 512-dim embedding from frame
+    Checks cosine similarity against all stored embeddings
+    If match found (score >= 0.85) → reject "face already registered"
+    If unique → stores embedding in ML service, returns embedding_id
+  Backend stores SHA256(embedding_bytes) as face_hash in users table
+  Backend also stores embedding_id reference
+  Face registration complete
+
+Step 3 — Aadhaar Verification (separate step)
+  User enters 12-digit Aadhaar number
+  Backend validates format (regex: exactly 12 digits, not all same)
+  Backend calls Aadhaar verification API (strategy pattern — see Section 21)
+    If API returns invalid → reject
+  Backend checks users table for duplicate aadhaar_number
+    If duplicate found → reject "Aadhaar already registered"
+  Store aadhaar_number in users table, set is_registered=true
+  Full JWT issued (is_registered=true)
+  Registration complete
+
+Step 2 — Skill Selection
+  User sees list of 6 skills
+  User picks one (e.g. electrician)
+  Backend checks: is user in cooldown for this skill? max attempts reached?
+  If allowed → application created (status: DOCUMENTS_PENDING)
+
+Step 3 — Document Upload
+  User uploads degree image (optional, single file)
+    → Backend calls ML service POST /degree/{candidate_id} sync
+    → Degree check result stored in DB immediately
+  User uploads workexp video (optional, chunked HTTP upload)
+    → Chunks reassembled by backend → stored on disk
+    → Backend sends to Kafka topic: candidate.workexp.video
+    → ML service picks up for later processing
+  Status updated → INTERVIEW_PENDING
+
+Step 4 — Interview
+  User clicks "Start Interview"
+  Backend creates interview session → sends session config to chatbot module
+  WebSocket connection established (/interview/ws/{session_id})
+  Chatbot conducts 1-2 min audio interview (SarvamAI STT + Groq + SarvamAI TTS)
+  Frontend simultaneously streams video frames (separate WebSocket channel)
+  Both audio and video are buffered server-side during interview
+  User/system ends interview → backend marks session complete
+  Backend sends buffered audio chunks → Kafka: candidate.interview.audio
+  Backend sends buffered video chunks → Kafka: candidate.interview.video
+  Backend sends meta signal → Kafka: candidate.meta
+  Application status → ML_PROCESSING
+
+Step 5 — Result
+  Backend polls ML service GET /status/{candidate_id} every 30s (background task)
+  When status = DONE → fetch full verdict via GET /verdict/{candidate_id}
+  Store verdict in backend DB (ml_verdicts table)
+  Update application status → verdict value
+  Frontend polls GET /application/status/{application_id}
+  UI updates to show: READY / SKILL_TRAINING / MANUAL_VERIFICATION /
+                      UNSKILLED / FRAUD
+
+Step 6 — Cooldown
+  Regardless of result, cooldown_until = now + 60 days set on application
+  Attempt count incremented
+  If attempt == 3 → skill permanently locked for this user
+  User can choose a different skill immediately
+
+
+================================================================================
+3. TECH STACK
+================================================================================
+
+Framework     : FastAPI (async)
+Database      : PostgreSQL (backend DB, separate from ML service DB)
+ORM           : SQLAlchemy (async) + Alembic for migrations
+Caching       : Redis
+Messaging     : Kafka (aiokafka producer)
+Auth          : JWT (python-jose) + OTP via Twilio
+File Storage  : Local disk (hackathon) — same strategy pattern as ML service
+Chatbot       : low_latency_chat_bot integrated as module
+                  STT: SarvamAI streaming
+                  LLM: Groq (llama-3.3-70b-versatile)
+                  TTS: SarvamAI streaming
+Containerize  : Docker + Docker Compose
+
+
+================================================================================
+4. SYSTEM ARCHITECTURE
+================================================================================
+
+NextJS PWA
+  |
+  |-- HTTP/REST ──────────────────────────► FastAPI Backend
+  |-- WebSocket (chatbot audio) ──────────► /interview/ws/{session_id}
+  |-- WebSocket (interview video chunks) ► /interview/video-ws/{session_id}
+  |-- Chunked HTTP (workexp video) ───────► /documents/workexp/chunk
+  |
+  FastAPI Backend
+  |
+  |-- PostgreSQL (backend DB)
+  |     users, applications, sessions, documents, verdicts
+  |
+  |-- Redis
+  |     OTP cache, JWT session cache, rate limiting, verdict poll cache
+  |
+  |-- Kafka Producer ────────────────────► ML Service (via Kafka)
+  |     candidate.interview.video
+  |     candidate.interview.audio
+  |     candidate.workexp.video
+  |     candidate.meta
+  |
+  |-- HTTP calls ────────────────────────► ML Service (FastAPI)
+        POST /face-check (registration)
+        POST /degree/{id} (degree check)
+        GET  /status/{id} (poll pipeline)
+        GET  /verdict/{id} (fetch result)
+
+  Background Tasks (FastAPI lifespan):
+    - Poll ML service every 30s for PROCESSING applications
+    - Update verdict in DB when DONE
+
+
+================================================================================
+5. DATABASE SCHEMA
+================================================================================
+
+All tables use UUID primary keys. Timestamps in UTC.
+Keep it simple — 7 tables handle all cases.
+
+--------------------------------------------------------------------------------
+Table: users
+--------------------------------------------------------------------------------
+  id                  UUID        PK DEFAULT gen_random_uuid()
+  phone               VARCHAR(15) UNIQUE NOT NULL
+  aadhaar_number      VARCHAR(12) UNIQUE NULL    (NULL until step 3 complete)
+  aadhaar_verified    BOOLEAN     DEFAULT false  (true after API verification)
+  face_hash           VARCHAR(64) UNIQUE NULL    (SHA256 of ArcFace embedding bytes)
+  face_embedding_id   VARCHAR(100) NULL          (reference ID returned by ML service)
+  face_registered     BOOLEAN     DEFAULT false
+  is_registered       BOOLEAN     DEFAULT false  (true only after face + aadhaar done)
+  is_active           BOOLEAN     DEFAULT true   (false if FRAUD verdict)
+  created_at          TIMESTAMP   DEFAULT now()
+
+  -- pgvector extension required:
+  -- CREATE EXTENSION IF NOT EXISTS vector;
+  -- CREATE INDEX idx_users_face_embedding ON users
+  --   USING ivfflat (face_embedding vector_cosine_ops) WITH (lists=100);
+
+  NOTE:
+  - candidate_id in ML service = users.id (same UUID, no mapping table needed)
+  - face_hash: SHA256 of ArcFace embedding bytes — catches exact same image fast
+  - face_embedding: pgvector vector(512) — catches same person, different photo
+    via cosine similarity >= 0.85 threshold
+  - Both checks done entirely in backend (no ML service call during registration)
+  - aadhaar_number: UNIQUE at DB level + API verification via strategy pattern
+
+--------------------------------------------------------------------------------
+Table: skills
+--------------------------------------------------------------------------------
+  id          UUID        PK DEFAULT gen_random_uuid()
+  name        VARCHAR(50) UNIQUE NOT NULL
+  description TEXT
+
+  Seed data (insert on first run):
+    electrician, plumber, welder, carpenter, mason, labour
+
+--------------------------------------------------------------------------------
+Table: candidate_applications
+--------------------------------------------------------------------------------
+  id               UUID        PK DEFAULT gen_random_uuid()
+  user_id          UUID        FK → users.id NOT NULL
+  skill_id         UUID        FK → skills.id NOT NULL
+  attempt_number   INT         NOT NULL CHECK (attempt_number BETWEEN 1 AND 3)
+  status           VARCHAR(30) NOT NULL DEFAULT 'DOCUMENTS_PENDING'
+                               -- DOCUMENTS_PENDING
+                               -- INTERVIEW_PENDING
+                               -- INTERVIEW_DONE
+                               -- ML_PROCESSING
+                               -- READY
+                               -- SKILL_TRAINING
+                               -- MANUAL_VERIFICATION
+                               -- UNSKILLED
+                               -- FRAUD
+  cooldown_until   TIMESTAMP   NULL  (set after interview completes)
+  created_at       TIMESTAMP   DEFAULT now()
+  updated_at       TIMESTAMP   DEFAULT now()
+
+  UNIQUE(user_id, skill_id, attempt_number)
+  INDEX: user_id, skill_id, status
+
+--------------------------------------------------------------------------------
+Table: interview_sessions
+--------------------------------------------------------------------------------
+  id              UUID        PK DEFAULT gen_random_uuid()
+  application_id  UUID        FK → candidate_applications.id NOT NULL
+  transcript      JSONB       NULL  (full conversation history from chatbot)
+  started_at      TIMESTAMP   DEFAULT now()
+  ended_at        TIMESTAMP   NULL
+  status          VARCHAR(20) DEFAULT 'ACTIVE'
+                              -- ACTIVE, COMPLETED, ABANDONED
+
+  INDEX: application_id
+
+--------------------------------------------------------------------------------
+Table: documents
+--------------------------------------------------------------------------------
+  id              UUID        PK DEFAULT gen_random_uuid()
+  user_id         UUID        FK → users.id NOT NULL
+  application_id  UUID        FK → candidate_applications.id NOT NULL
+  doc_type        VARCHAR(20) NOT NULL   -- DEGREE, WORKEXP_VIDEO
+  file_path       TEXT        NOT NULL
+  uploaded_at     TIMESTAMP   DEFAULT now()
+
+  INDEX: application_id, doc_type
+
+--------------------------------------------------------------------------------
+Table: ml_verdicts
+--------------------------------------------------------------------------------
+  id                  UUID        PK DEFAULT gen_random_uuid()
+  application_id      UUID        FK → candidate_applications.id UNIQUE NOT NULL
+  session_id          UUID        FK → interview_sessions.id
+  verdict             VARCHAR(30) -- READY/SKILL_TRAINING/MANUAL_VERIFICATION/
+                                  -- UNSKILLED/FRAUD
+  composite_score     FLOAT
+  fraud_score         FLOAT
+  fraud_level         VARCHAR(20)
+  domain_score        FLOAT
+  communication_score FLOAT
+  skill_confidence    FLOAT
+  full_result         JSONB       -- complete ML service response stored here
+  fetched_at          TIMESTAMP   DEFAULT now()
+
+  INDEX: application_id
+
+--------------------------------------------------------------------------------
+Table: admin_users
+--------------------------------------------------------------------------------
+  id          UUID        PK DEFAULT gen_random_uuid()
+  phone       VARCHAR(15) UNIQUE NOT NULL
+  name        VARCHAR(100)
+  role        VARCHAR(20) DEFAULT 'OFFICER'  -- OFFICER, SUPER_ADMIN
+  is_active   BOOLEAN     DEFAULT true
+  created_at  TIMESTAMP   DEFAULT now()
+
+  NOTE: Admins log in via same OTP flow but get a different JWT role claim.
+        Super admin can add/remove officers.
+
+
+================================================================================
+6. REDIS CACHING STRATEGY
+================================================================================
+
+All Redis keys use structured prefixes. TTLs are explicit.
+
+OTP cache:
+  Key : otp:{phone}
+  Val : {"otp": "123456", "attempts": 2}
+  TTL : 600s (10 min)
+  Use : verify OTP, track wrong attempts (max 3 wrong = invalidate)
+
+Rate limiting (OTP sends):
+  Key : ratelimit:otp:{phone}
+  Val : count (INCR)
+  TTL : 3600s (1 hour)
+  Use : max 3 OTP sends per hour per phone
+
+JWT session cache:
+  Key : session:{user_id}
+  Val : {"role": "user", "phone": "...", "is_active": true}
+  TTL : 86400s (24 hours, refreshed on activity)
+  Use : fast JWT validation without DB hit on every request
+
+Verdict poll cache (avoid hammering ML service):
+  Key : ml_status:{application_id}
+  Val : {"status": "PROCESSING"} or {"status": "DONE", "verdict": "READY"}
+  TTL : 60s (refresh every 60s from background poller)
+  Use : frontend hits GET /application/status → served from Redis, not ML service
+
+Cooldown cache (fast check before DB):
+  Key : cooldown:{user_id}:{skill_id}
+  Val : ISO timestamp of cooldown_until
+  TTL : set to match cooldown_until duration
+  Use : reject skill selection immediately without DB query
+
+
+================================================================================
+7. KAFKA — WHAT BACKEND PRODUCES
+================================================================================
+
+Backend is a PRODUCER ONLY. It never consumes from Kafka.
+
+Topic: candidate.interview.video
+  When: after interview session ends
+  Key : candidate_id (= user.id)
+  Message: {candidate_id, chunk_seq, is_last, data: base64}
+
+Topic: candidate.interview.audio
+  When: after interview session ends
+  Key : candidate_id
+  Message: {candidate_id, chunk_seq, is_last, data: base64}
+
+Topic: candidate.workexp.video
+  When: after workexp video fully uploaded and assembled
+  Key : candidate_id
+  Message: {candidate_id, chunk_seq, is_last, data: base64}
+
+Topic: candidate.meta
+  When: after all media sent (last step before ML pipeline starts)
+  Key : candidate_id
+  Message:
+    {
+      "candidate_id":  "uuid",
+      "has_workexp":   true,
+      "has_degree":    false,
+      "claimed_role":  "electrician",
+      "session_id":    "uuid",
+      "application_id":"uuid"
+    }
+
+Chunk size: 256KB per chunk (balance between latency and overhead)
+Sending order: workexp video first, then interview audio, then interview video,
+               then meta LAST (meta triggers ML pipeline, so send it last)
+
+
+================================================================================
+8. CHATBOT INTEGRATION (low_latency_chat_bot)
+================================================================================
+
+The chatbot (https://github.com/a-nnurag/low_latency_chat_bot) is brought
+in as a module inside the backend, not as a separate service.
+
+Original chatbot:
+  - WebSocket /ws
+  - Audio pipeline: browser PCM → buffer 32KB → WAV → SarvamAI STT → Groq → SarvamAI TTS
+  - ConversationState: history (10 exchanges), language detection
+  - llama-3.3-70b-versatile via Groq, temp=0.7, max_tokens=150
+  - Supports: Hindi, English, Kannada, Telugu, Tamil, etc.
+
+Modifications needed for NammaKelsa:
+
+1. Session binding
+   Original /ws endpoint → new /interview/ws/{session_id}
+   On connect: load session from DB, get claimed_role, load role-specific prompt
+   On disconnect: save final transcript to interview_sessions.transcript
+
+2. Interview question control
+   Add interview_controller.py:
+     - Track question number (target: 8-10 questions)
+     - Detect when interview is complete (question count OR time limit 2 min)
+     - Emit "INTERVIEW_COMPLETE" signal to backend
+     - Backend triggers Kafka send
+
+3. Video capture (new addition)
+   Add second WebSocket endpoint: /interview/video-ws/{session_id}
+   Frontend sends video frames as binary (JPEG bytes, 1 frame/sec)
+   Backend buffers frames in memory during interview
+   After interview: encode frames as MP4 chunks → send to Kafka
+
+4. Transcript capture
+   Save full conversation history to interview_sessions.transcript (JSONB)
+   Format:
+     [
+       {"role": "assistant", "content": "Tell me about your experience..."},
+       {"role": "user",      "content": "I have worked for 3 years..."},
+       ...
+     ]
+
+5. System prompt injection
+   Replace static system prompt with dynamic one from system_prompts.py
+   Loaded per session based on claimed_role
+
+File: backend/interview/chatbot.py (modified copy of low_latency_chat_bot)
+
+
+================================================================================
+9. SYSTEM PROMPT DESIGN FOR GROQ (PER SKILL)
+================================================================================
+
+Optimization goals for Groq (llama-3.3-70b-versatile):
+  - Keep prompt under 500 tokens (Groq charges per token, speed matters)
+  - Be directive: tell model exactly what to ask, in what order
+  - Enable multi-language: user responds in their language, bot follows
+  - Target 8-10 questions in 90-120 seconds
+  - End interview gracefully when questions exhausted
+
+Base template (all skills):
+  You are a friendly interviewer for NammaKelsa, a job placement platform
+  for skilled workers. You are conducting a spoken interview for a candidate
+  applying as a {SKILL_NAME}.
+
+  Rules:
+  - Respond in the SAME language the candidate uses
+  - Ask ONE question at a time. Keep it SHORT (1 sentence)
+  - After 8 questions, say "Thank you, that's all for now!"
+  - Do not evaluate or judge. Just ask questions and listen.
+  - Fix STT errors in names/places silently
+  - Max 2 sentences per response
+
+  Questions to cover (ask in this order, adapt based on answers):
+  {SKILL_SPECIFIC_QUESTIONS}
+
+Skill-specific question banks:
+
+ELECTRICIAN:
+  1. How many years have you worked as an electrician?
+  2. What types of wiring work have you done? (domestic / industrial / both)
+  3. How do you stay safe when working with live wires?
+  4. What tools do you use every day?
+  5. Have you worked with 3-phase connections?
+  6. What do you do if you find a short circuit?
+  7. Can you read electrical diagrams or drawings?
+  8. Have you worked on any big projects? Tell me about one.
+
+PLUMBER:
+  1. How many years have you worked as a plumber?
+  2. What kind of plumbing work have you done? (residential / commercial)
+  3. What pipes do you usually work with? (PVC / CPVC / iron)
+  4. How do you find where a water leak is?
+  5. Have you installed bathroom fixtures before?
+  6. How do you handle a blocked drain?
+  7. Do you know how to read plumbing drawings?
+  8. Tell me about a difficult job you solved.
+
+WELDER:
+  1. How many years have you been welding?
+  2. What welding types can you do? (MIG / TIG / Arc / Gas)
+  3. What metals have you welded?
+  4. What safety equipment do you always wear?
+  5. How do you check the quality of a weld?
+  6. Have you worked on structural welding or just small jobs?
+  7. Can you read welding blueprints?
+  8. Tell me about your most challenging welding job.
+
+CARPENTER:
+  1. How many years have you worked as a carpenter?
+  2. What kind of work do you mostly do? (furniture / doors / roofing / formwork)
+  3. What wood types do you work with?
+  4. What are your main tools?
+  5. How do you measure and cut accurately?
+  6. Have you made furniture or done site carpentry?
+  7. Can you read drawings or sketches?
+  8. Tell me about a project you are proud of.
+
+MASON:
+  1. How many years have you been doing masonry work?
+  2. What kind of masonry do you do? (brickwork / plastering / tiling / all)
+  3. How do you mix mortar correctly?
+  4. How do you ensure a wall is straight and level?
+  5. What is your experience with different bricks or blocks?
+  6. Have you worked on large construction sites?
+  7. How do you handle cracks in plaster?
+  8. Tell me about a construction project you worked on.
+
+LABOUR:
+  1. What kind of construction or site work have you done before?
+  2. How many years of site work experience do you have?
+  3. What heavy tools or machines have you operated?
+  4. How do you stay safe on a construction site?
+  5. Can you read simple site instructions or signs?
+  6. What is the hardest physical work you have done?
+  7. Are you comfortable working at heights or in confined spaces?
+  8. Tell me about a team you worked in on site.
+
+
+================================================================================
+10. WORKEXP VIDEO CHUNKED UPLOAD FLOW
+================================================================================
+
+This is a PRE-INTERVIEW upload, not real-time. Uses HTTP chunked upload,
+NOT WebSocket or Kafka directly from frontend.
+
+Design goal: support low-bandwidth regions (2G/3G).
+Max video size: 100MB enforced at both frontend (before upload) and backend.
+Chunk size: 64KB per chunk (small = recoverable on bad connection)
+Resumable: upload_id persists in Redis so interrupted uploads can resume.
+
+Step 1 — Init
+  POST /documents/workexp/init
+  Body: {application_id, total_chunks, file_size_bytes, file_name}
+  Validation:
+    file_size_bytes > 100 * 1024 * 1024 → reject "Max video size is 100MB"
+    file_name extension not in [mp4, mov, webm, avi] → reject
+  Backend creates upload record in Redis:
+    Key: upload:{upload_id} → {application_id, total_chunks, received: [],
+                                status: "in_progress", created_at}
+    TTL: 86400s (24h — resume window)
+  Creates: /tmp/backend/workexp/{upload_id}/ directory
+  Response: {upload_id, chunk_size_bytes: 65536, resume_from: 0}
+
+Step 2 — Send chunks (frontend sends sequentially, retries on failure)
+  POST /documents/workexp/chunk
+  Body: multipart/form-data {upload_id, chunk_seq, is_last, file: bytes}
+  Backend validates:
+    chunk_seq not already received (idempotent — skip duplicate chunks)
+    Cumulative size so far <= 100MB
+  Writes chunk: /tmp/backend/workexp/{upload_id}/{chunk_seq:05d}.bin
+  Updates Redis received list: RPUSH upload:{upload_id}:received chunk_seq
+  Response: {chunk_seq, status: "received", next_expected: chunk_seq+1}
+
+Step 3 — Resume support
+  GET /documents/workexp/status/{upload_id}
+  Response: {received_chunks: [0,1,2,...], missing: [3], status: "in_progress"}
+  Frontend uses missing list to re-send only dropped chunks
+
+Step 4 — Backend assembles when is_last=True
+  Sorts chunks by chunk_seq
+  Validates: received count == total_chunks, no gaps
+  If gap found → response: {status: "missing_chunks", missing: [3,7]}
+               → frontend re-sends missing chunks
+  If complete:
+    Assembles to: /tmp/backend/workexp/{upload_id}/assembled.mp4
+    Validates assembled file size <= 100MB (final check)
+    Stores path in documents table
+    Sends assembled video as 256KB chunks → Kafka: candidate.workexp.video
+    Deletes chunk files, keeps assembled.mp4 until ML processing done
+
+Step 5 — Response
+  {status: "uploaded", document_id: "uuid"}
+  Application status stays INTERVIEW_PENDING
+
+
+================================================================================
+11. INTERVIEW VIDEO/AUDIO FLOW
+================================================================================
+
+During interview (real-time capture):
+
+Audio:
+  Browser captures PCM audio → WebSocket /interview/ws/{session_id}
+  Chatbot module processes it (STT → Groq → TTS) in real-time
+  SIMULTANEOUSLY: raw PCM audio is buffered in memory (interview_sessions)
+  Buffer stored as list of (seq, bytes) tuples in memory per session
+
+Video:
+  Browser captures video frames (1 frame/sec, JPEG ~10-20KB each)
+  Sent via second WebSocket: /interview/video-ws/{session_id}
+  Frames buffered in memory (seq, bytes) list per session
+
+After interview ends:
+
+Audio buffer:
+  Concatenate all PCM chunks → encode to WAV
+  Split WAV into 256KB Kafka chunks → produce to candidate.interview.audio
+  Delete from memory
+
+Video buffer:
+  Encode JPEG frames to MP4 using cv2.VideoWriter
+  Split MP4 into 256KB Kafka chunks → produce to candidate.interview.video
+  Delete from memory
+
+Then: produce to candidate.meta → ML pipeline starts
+
+Memory concern:
+  1-2 min interview audio at 16kHz 16-bit mono = ~3.8MB
+  1-2 min video at 1fps JPEG = ~120 frames × ~15KB = ~1.8MB
+  Total per session in memory: ~6MB — acceptable for hackathon
+  For production: write buffers to disk during interview, not memory
+
+
+================================================================================
+12. ML SERVICE INTEGRATION
+================================================================================
+
+Backend calls ML service via HTTP (not direct DB access).
+
+1. Face uniqueness check (during registration, SYNC):
+   POST http://ml-service:8000/face-check
+   Body: {candidate_id: user.id, image: base64}
+   Response: {is_unique: bool, matched_candidate_id: uuid|null}
+   If is_unique=false → registration rejected, "face already registered"
+
+2. Degree check (after degree upload, SYNC):
+   POST http://ml-service:8000/degree/{candidate_id}
+   Body: multipart image
+   Response: {is_valid_doc, extracted_degree, extracted_institution}
+   Store result in ml_verdicts.full_result (partial update)
+
+3. Pipeline status polling (ASYNC, background task):
+   Every 30s, check all applications with status=ML_PROCESSING:
+   GET http://ml-service:8000/status/{candidate_id}
+   If status=DONE:
+     GET http://ml-service:8000/verdict/{candidate_id}
+     Store in ml_verdicts table
+     Update candidate_applications.status = verdict value
+     Update Redis verdict cache key
+
+4. Manual re-trigger (admin only):
+   POST http://ml-service:8000/admin/trigger/{candidate_id}
+
+
+================================================================================
+13. OTP AUTH FLOW (TWILIO)
+================================================================================
+
+Three-step registration flow (OTP → Face → Aadhaar):
+
+  Step A: POST /auth/send-otp
+    Body: {phone: "+919XXXXXXXXX"}
+    Check ratelimit:otp:{phone} → reject if >= 3 sends in last hour
+    Generate 6-digit OTP → store Redis otp:{phone} TTL 600s
+    Send via Twilio SMS
+    Response: {message: "OTP sent", expires_in: 600}
+
+  Step B: POST /auth/verify-otp
+    Body: {phone, otp}
+    Check Redis otp:{phone}, track wrong attempts (max 3, then force resend)
+    If correct → delete OTP key
+    Check if user exists:
+      New user → create user row (phone only, is_registered=false)
+      Existing user → load user
+    JWT payload: {user_id, phone, role, is_registered, exp}
+    Cache: Redis session:{user_id} TTL 86400s
+    Response: {token, is_new_user, is_registered}
+    If is_registered=false → frontend routes to face registration step
+
+  Step C: POST /register/face  (requires JWT, is_registered=false)
+    Body: multipart short video (3-5 sec, max 10MB)
+    Backend extracts best frame: iterate frames, pick one where
+      OpenCV face detector finds a face with confidence > 0.9
+    Quick hash check: SHA256(frame_bytes) against users.face_hash
+      If exact match exists → reject "face already registered" (fast path)
+    Call ML service POST /face-check {candidate_id: user_id, frame: base64}
+      ML service returns {is_unique, embedding_id, face_hash}
+      If is_unique=false → reject "face already registered"
+    Store users.face_hash = face_hash, face_embedding_id = embedding_id
+    Set users.face_registered = true
+    Response: {status: "face_registered"}
+
+  Step D: POST /register/aadhaar  (requires JWT, face_registered=true)
+    Body: {aadhaar_number: "XXXXXXXXXXXX"}
+    Validate format: 12 digits, not all same digit (Verhoeff algorithm optional)
+    Check DB: SELECT id FROM users WHERE aadhaar_number=? → reject if found
+    Call Aadhaar verification API (see Section 21 — strategy pattern)
+      If API returns invalid → reject "Aadhaar verification failed"
+    Store aadhaar_number, set aadhaar_verified=true, is_registered=true
+    Reissue JWT with is_registered=true
+    Response: {status: "registered", token: new_jwt}
+
+Login (returning user):
+  Steps A + B only. If is_registered=true → full access JWT issued directly.
+  If is_registered=false → resume incomplete registration from last step.
+
+Admin login: same Steps A + B, phone must exist in admin_users table.
+             JWT gets role="admin" or "super_admin".
+
+JWT validation middleware:
+  All protected routes → extract JWT → check Redis session:{user_id} → validate
+  Redis miss → check DB → re-cache
+  Routes requiring is_registered=true → middleware checks JWT claim
+
+
+================================================================================
+14. ATTEMPT & COOLDOWN LOGIC
+================================================================================
+
+Rules:
+  - Max 3 attempts per skill per user (hard limit)
+  - 2-month (60-day) cooldown after EACH attempt (win or lose)
+  - Different skills are fully independent
+  - FRAUD verdict: permanently block user from ALL skills (is_active=false)
+
+Skill selection check (POST /skills/choose):
+  1. Check if user is_active (FRAUD block)
+  2. Count existing attempts for this skill:
+       SELECT count(*) FROM candidate_applications
+       WHERE user_id=? AND skill_id=? → if >= 3, return "max attempts reached"
+  3. Check latest cooldown:
+       SELECT cooldown_until FROM candidate_applications
+       WHERE user_id=? AND skill_id=?
+       ORDER BY created_at DESC LIMIT 1
+       If cooldown_until > now() → return "in cooldown, try after {date}"
+  4. Create new application with attempt_number = existing_count + 1
+
+Cooldown set when:
+  Interview session ends (status → INTERVIEW_DONE)
+  cooldown_until = ended_at + 60 days
+  Set immediately, before ML verdict arrives
+  (User is in cooldown whether they pass or fail)
+
+FRAUD handling:
+  If ML verdict = FRAUD:
+    Set users.is_active = false
+    All future login attempts blocked
+    Admin notified (log entry + admin dashboard flag)
+
+
+================================================================================
+15. ADMIN DASHBOARD
+================================================================================
+
+Admin users are created manually (super_admin inserts into admin_users table).
+They log in via the same OTP flow but phone must be in admin_users.
+
+Admin can see:
+  - All candidates list (paginated, filterable by skill/status/date)
+  - Individual candidate full detail:
+      Registration info (phone, Aadhaar masked, face registered)
+      All applications with attempt history
+      Interview transcript
+      ML verdict breakdown (fraud_score, domain_score, etc.)
+      Degree check result
+      Documents list
+  - Override verdict (manual review cases):
+      PUT /admin/verdict/{application_id}/override
+      Body: {verdict: "READY", reason: "manual review passed"}
+      Updates candidate_applications.status and ml_verdicts.verdict
+
+Admin cannot:
+  - See raw Aadhaar number (masked: XXXXXXXX1234)
+  - Access other admin accounts (super_admin only)
+  - Delete users or applications (soft-delete only)
+
+
+================================================================================
+16. API ENDPOINTS
+================================================================================
+
+--- AUTH ---
+POST   /auth/send-otp                    send OTP to phone (Twilio)
+POST   /auth/verify-otp                  verify OTP, return partial JWT
+
+  NOTE — Frontend BFF pattern (added 2025-05-03):
+  The frontend (Next.js) does NOT call these endpoints directly from the browser.
+  All auth calls go through same-origin BFF route handlers in Next.js:
+    Browser → POST /api/auth/citizen/send-otp  → (server-side) → /auth/send-otp
+    Browser → POST /api/auth/citizen/verify-otp → (server-side) → /auth/verify-otp
+                                                   sets httpOnly cookie nk_token
+    Browser → POST /api/auth/admin/send-otp    → (server-side) → /admin/auth/send-otp
+    Browser → POST /api/auth/admin/verify-otp  → (server-side) → /admin/auth/verify-otp
+                                                   sets httpOnly cookie nk_token + nk_role
+  The JWT (nk_token) is NEVER exposed to client-side JavaScript.
+  The backend API_BASE_URL is a server-only env var — not in NEXT_PUBLIC_ prefix.
+
+--- REGISTRATION (step-by-step, each requires JWT from previous step) ---
+POST   /register/face                    upload 3-5s face video, extract frame,
+                                         uniqueness check via ML service
+POST   /register/aadhaar                 submit Aadhaar, API verify, dup check,
+                                         returns full JWT (is_registered=true)
+GET    /register/status                  which step is complete / pending
+
+--- SKILLS ---
+GET    /skills                           list all 6 skills (public)
+POST   /skills/choose                    select skill for application
+GET    /skills/my-applications           list user's skill applications + status
+
+--- DOCUMENTS ---
+POST   /documents/degree                 upload degree image (sync ML check)
+POST   /documents/workexp/init           init chunked workexp video upload
+POST   /documents/workexp/chunk          send one chunk
+GET    /documents/workexp/status/{id}    check upload progress
+
+--- INTERVIEW ---
+POST   /interview/start                  create session, get session_id
+WS     /interview/ws/{session_id}        chatbot audio WebSocket
+WS     /interview/video-ws/{session_id}  video frame stream WebSocket
+POST   /interview/end/{session_id}       end interview, trigger Kafka send
+
+--- APPLICATION STATUS ---
+GET    /application/status/{id}          poll status (served from Redis cache)
+GET    /application/result/{id}          full verdict (only when DONE)
+
+--- ADMIN AUTH (OTP login for officers and super-admins) ---
+POST   /admin/auth/send-otp             send OTP — only if phone exists in admin_users table
+                                        (silent success for unknown phones — prevents enumeration)
+                                        Redis key: admin:{phone}  (namespaced from citizen otp:{phone})
+POST   /admin/auth/verify-otp           verify OTP, return JWT with role=officer|super_admin
+                                        Response: {token, role, name}
+
+--- ADMIN PORTAL (requires officer or super_admin JWT) ---
+GET    /admin/candidates                 list all (filter: skill, status, date)
+GET    /admin/candidate/{user_id}        full candidate detail
+PUT    /admin/verdict/{app_id}/override  override ML verdict
+GET    /admin/stats                      dashboard stats (counts by verdict/skill)
+POST   /admin/users                      create new officer (super_admin only)
+
+--- HEALTH ---
+GET    /health                           backend + DB + Redis + Kafka + ML service status
+
+
+================================================================================
+17. FOLDER STRUCTURE
+================================================================================
+
+backend/
+├── main.py                              # FastAPI app, all routers, lifespan events
+├── config.py                            # pydantic-settings, all env vars
+│
+├── auth/
+│   ├── otp.py                           # Twilio OTP send/verify logic
+│   ├── jwt.py                           # JWT create/validate, Redis session
+│   ├── middleware.py                    # JWT middleware, is_registered check
+│   ├── aadhaar_verifier.py              # AadhaarVerifierBackend ABC + implementations
+│   │                                    # (SurepassVerifier, MockVerifier, etc.)
+│   └── routes.py                        # POST /auth/send-otp, /auth/verify-otp
+│
+├── registration/
+│   ├── face.py                          # extract best frame from video,
+│   │                                    # DeepFace ArcFace embedding (backend),
+│   │                                    # SHA256 hash check (fast),
+│   │                                    # pgvector cosine similarity check,
+│   │                                    # store embedding + hash in users table
+│   │                                    # NO ML service call — all in backend
+│   └── routes.py                        # POST /register/face, /register/aadhaar,
+│                                        # GET /register/status
+│
+├── skills/
+│   ├── cooldown.py                      # attempt count + cooldown check logic
+│   └── routes.py                        # GET /skills, POST /skills/choose
+│
+├── documents/
+│   ├── chunked_upload.py                # workexp video chunk assembly
+│   ├── degree.py                        # degree upload + ML sync call
+│   └── routes.py
+│
+├── interview/
+│   ├── chatbot.py                       # low_latency_chat_bot (modified)
+│   │                                    #   - session binding to application_id
+│   │                                    #   - dynamic system prompt injection
+│   │                                    #   - transcript save
+│   │                                    #   - interview completion detection
+│   ├── controller.py                    # question counter, time limit, end signal
+│   ├── media_buffer.py                  # buffer audio PCM + video frames in memory
+│   ├── system_prompts.py                # per-skill prompts optimized for Groq
+│   └── routes.py                        # POST /start, WS /ws, WS /video-ws, POST /end
+│
+├── pipeline/
+│   ├── kafka_producer.py                # send chunks to 4 Kafka topics
+│   ├── ml_client.py                     # HTTP calls to ML service (face, degree, verdict)
+│   ├── poller.py                        # background task: poll ML status every 30s
+│   └── routes.py                        # GET /application/status, /application/result
+│
+├── admin/
+│   └── routes.py                        # all /admin/* endpoints
+│
+├── db/
+│   ├── session.py                       # async SQLAlchemy engine + session factory
+│   ├── models.py                        # all 7 ORM models
+│   ├── crud.py                          # all DB operations (no raw SQL in routes)
+│   └── migrations/                      # Alembic migration files
+│
+├── cache/
+│   └── redis_client.py                  # Redis client, OTP/session/cooldown helpers
+│
+├── kafka/
+│   └── producer.py                      # AIOKafka producer singleton
+│
+├── core/
+│   └── logging.py                       # structured JSON logging (user_id in every line)
+│
+├── Dockerfile
+├── docker-compose.yml                   # backend, postgres, redis, redpanda, redpanda-console, ml-service, celery-worker
+├── requirements.txt
+└── .env.example
+
+
+================================================================================
+18. ENVIRONMENT VARIABLES
+================================================================================
+
+# Server
+BACKEND_PORT=8001
+LOG_LEVEL=INFO
+
+# PostgreSQL (backend DB — separate from ML service DB)
+DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/nammakelsa_backend
+
+# Redis
+REDIS_URL=redis://localhost:6379
+REDIS_DB=2    # DB 0 and 1 used by ML service
+
+# Kafka
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+
+# Twilio (OTP)
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_FROM_NUMBER=+1XXXXXXXXXX
+
+# Aadhaar verification (strategy pattern)
+AADHAAR_VERIFIER_BACKEND=mock        # mock | surepass | signzy | uidai_sandbox
+SUREPASS_API_KEY=
+SUREPASS_API_URL=
+SIGNZY_API_KEY=
+
+# Workexp video
+MAX_WORKEXP_VIDEO_SIZE_MB=100
+WORKEXP_CHUNK_SIZE_BYTES=65536       # 64KB per chunk from frontend
+
+# JWT
+JWT_SECRET_KEY=
+JWT_ALGORITHM=HS256
+JWT_EXPIRY_HOURS=24
+
+# ML Service
+ML_SERVICE_URL=http://ml-service:8000
+
+# SarvamAI (chatbot STT/TTS)
+SARVAM_API_KEY=
+
+# Groq (chatbot LLM)
+GROQ_API_KEY=
+
+# File storage
+LOCAL_STORAGE_DIR=/tmp/backend
+
+# Polling
+ML_POLL_INTERVAL_SECONDS=30
+
+
+================================================================================
+19. BUILD ORDER
+================================================================================
+
+Phase 1 — Foundation
+  1. config.py
+  2. db/session.py + db/models.py (all 7 tables)
+  3. db/crud.py
+  4. cache/redis_client.py
+  5. core/logging.py
+
+Phase 2 — Auth
+  6. auth/otp.py (Twilio integration)
+  7. auth/jwt.py
+  8. auth/middleware.py
+  9. auth/routes.py
+  Test: send OTP → verify → get JWT
+
+Phase 3 — Registration
+  10. pipeline/ml_client.py (face-check + degree + verdict HTTP calls)
+  11. registration/face.py
+  12. registration/routes.py
+  Test: register user, face check via mock ML service
+
+Phase 4 — Skills & Documents
+  13. skills/cooldown.py
+  14. skills/routes.py
+  15. documents/chunked_upload.py
+  16. documents/degree.py
+  17. documents/routes.py
+
+Phase 5 — Kafka
+  18. kafka/producer.py (AIOKafka singleton)
+  19. pipeline/kafka_producer.py (chunk send functions)
+
+Phase 6 — Interview
+  20. interview/system_prompts.py (all 6 role prompts)
+  21. interview/chatbot.py (modified low_latency_chat_bot)
+  22. interview/controller.py
+  23. interview/media_buffer.py
+  24. interview/routes.py
+
+Phase 7 — Pipeline & Polling
+  25. pipeline/poller.py (background task)
+  26. pipeline/routes.py
+
+Phase 8 — Admin
+  27. admin/routes.py
+
+Phase 9 — Wire up
+  28. main.py (include all routers, lifespan events: start poller, start kafka producer)
+  29. Dockerfile + docker-compose.yml
+  30. .env.example
+
+
+================================================================================
+21. AADHAAR VERIFICATION — STRATEGY PATTERN
+================================================================================
+
+The Aadhaar API contract is simple: send a 12-digit number, get back
+is_valid=true/false. Nothing else is needed from the API.
+
+Abstract interface (auth/aadhaar_verifier.py):
+  class AadhaarVerifierBackend(ABC):
+      async def verify(self, aadhaar_number: str) -> bool
+      # Returns True if Aadhaar number is valid, False otherwise
+      # Raises AadhaarAPIError if the API itself fails (→ HTTP 503 to client)
+
+Implementations:
+
+  MockAadhaarVerifier  ← DEFAULT for hackathon
+    Always returns True for any 12-digit number.
+    Used for local dev and demos where no real API key is available.
+
+  SurepassAadhaarVerifier
+    POST https://kyc-api.surepass.io/api/v1/aadhaar-v2/...
+    Auth: Bearer token in header
+    Returns: parse response → True/False
+
+  SignzyAadhaarVerifier
+    POST to Signzy endpoint
+    Returns: parse response → True/False
+
+Selection:
+  AADHAAR_VERIFIER_BACKEND=mock       ← set this for hackathon
+  AADHAAR_VERIFIER_BACKEND=surepass   ← set for production
+
+All implementations have the same signature. Swapping = change one env var.
+
+Backend always does BOTH:
+  1. API check: verifier.verify(aadhaar_number) → True/False
+  2. DB duplicate check: SELECT 1 FROM users WHERE aadhaar_number=?
+  Both must pass. DB check catches duplicate even if API says valid.
+
+Additional env vars:
+  AADHAAR_VERIFIER_BACKEND=mock
+  SUREPASS_API_KEY=
+  SIGNZY_API_KEY=
+
+
+================================================================================
+22. FACE DUPLICATE DETECTION — DONE ENTIRELY IN BACKEND (pgvector)
+================================================================================
+
+Face duplicate detection during registration is fully owned by the backend.
+The ML service is NOT called for this. This is production-ready.
+
+Why backend can own this:
+  - DeepFace (ArcFace) runs inside the backend process
+  - Embeddings stored in Postgres using pgvector extension (vector(512) column)
+  - pgvector IVFFlat index does cosine similarity search across millions of
+    rows in milliseconds — scales to production without external ML service
+  - Same ArcFace model used in ML service, so embeddings are compatible
+
+How it works:
+
+  Step 1 — Extract embedding (backend, registration/face.py):
+    from deepface import DeepFace
+    result = DeepFace.represent(frame, model_name="ArcFace", enforce_detection=True)
+    embedding = result[0]["embedding"]        # 512-dim float list
+    embedding_bytes = np.array(embedding, dtype=np.float32).tobytes()
+    face_hash = hashlib.sha256(embedding_bytes).hexdigest()
+
+  Step 2 — Fast exact check (hash lookup):
+    SELECT id FROM users WHERE face_hash = ?
+    If found → reject immediately (same image submitted twice)
+    No vector computation needed.
+
+  Step 3 — Cosine similarity check (pgvector):
+    SELECT id, phone, 1 - (face_embedding <=> ?) AS similarity
+    FROM users
+    WHERE face_embedding IS NOT NULL
+    ORDER BY face_embedding <=> ?
+    LIMIT 1
+    If similarity >= 0.85 → reject "face already registered to another account"
+
+  Step 4 — Store if unique:
+    UPDATE users SET
+      face_hash = ?,
+      face_embedding = ?,        -- pgvector vector(512) column
+      face_registered = true
+    WHERE id = ?
+
+Postgres schema addition (pgvector):
+  CREATE EXTENSION IF NOT EXISTS vector;
+
+  -- In users table:
+  face_hash       VARCHAR(64)  UNIQUE NULL
+  face_embedding  vector(512)  NULL
+
+  -- Index for fast ANN search:
+  CREATE INDEX idx_users_face_embedding
+    ON users USING ivfflat (face_embedding vector_cosine_ops)
+    WITH (lists = 100);
+    -- lists=100 is good for up to 1M rows. Increase to 1000 for 10M+ rows.
+
+Performance:
+  Exact hash check: O(1) index lookup — negligible
+  Vector similarity search (IVFFlat): ~5-20ms for 100K users
+  Embedding extraction (DeepFace ArcFace): ~200-400ms on CPU
+  Total registration face check: under 500ms on CPU, under 100ms on GPU
+
+DeepFace model warm-up:
+  Load ArcFace model once at backend startup (same singleton pattern as ML service)
+  Prevents 3-5s cold start on first registration call
+
+
+================================================================================
+20. KEY DESIGN DECISIONS & RATIONALE
+================================================================================
+
+Why OTP only (no password)?
+  Target users are blue-collar workers with basic smartphone literacy.
+  OTP on phone number is simpler and more accessible than password + email.
+  Twilio is reliable and handles delivery across Indian operators.
+
+Why Aadhaar API verification (not just format check)?
+  Simple format check (12 digits) would allow fake Aadhaar numbers.
+  API verification confirms the number is a real registered Aadhaar.
+  Strategy pattern (Section 21) allows swapping providers without code change.
+  Duplicate Aadhaar check at DB level prevents identity reuse across accounts.
+  MockAadhaarVerifier used for local dev/hackathon if no API key available.
+
+Why candidate_id in ML service = user.id from backend?
+  Eliminates a join. ML service stores face/voice embeddings keyed by candidate_id.
+  Backend user.id (UUID) is passed as candidate_id to all ML calls.
+  No separate ID mapping table needed.
+
+Why face duplicate detection is done entirely in the backend (not ML service)?
+  Registration is a synchronous user-facing flow — needs fast response.
+  Backend stores face_embedding in Postgres using pgvector (vector(512) column).
+  pgvector IVFFlat index does cosine similarity across all users in ~5-20ms.
+  SHA256 hash catches exact same image resubmission without any vector math.
+  No network hop to ML service = simpler, faster, no cross-service dependency
+  during a critical onboarding step.
+  DeepFace ArcFace loaded as singleton at backend startup — ~200ms per call.
+  ML service still owns face validation DURING the interview (fraud pipeline).
+
+Why face registration uses a short video instead of a photo?
+  A static photo can be spoofed easily.
+  Extracting the best frame from a short video gives backend control over
+  quality (sharpness, frontal face, confidence > 0.9).
+  The video itself is discarded — only the extracted frame is used.
+  This also sets up liveness detection for future enhancement.
+
+Why workexp video chunk size is 64KB (not 256KB like Kafka chunks)?
+  64KB chunks from frontend → handles 2G connections (typical upload ~50KB/s).
+  Each chunk uploads in ~1 second on 2G, making retries fast and cheap.
+  Backend assembles to full file first, then re-chunks to 256KB for Kafka.
+  Two different chunk sizes serve two different purposes:
+    frontend→backend: optimize for low-bandwidth upload
+    backend→Kafka: optimize for Kafka throughput
+
+Why cooldown set at interview end, not verdict?
+  Prevents abuse: user can't keep retrying while waiting for ML result.
+  Verdict may take up to 2 days — cooldown must start immediately.
+  Fair to candidate: cooldown clock starts when they complete interview.
+
+Why buffer video/audio in memory during interview (not disk)?
+  Interview is 90-120 seconds. Audio ~4MB, video ~2MB = ~6MB per session.
+  Memory is simpler for hackathon (no temp file management during live session).
+  Post-interview: written to disk briefly then chunked to Kafka.
+  Production path: use Redis streams or disk buffer for multi-instance safety.
+
+Why background poller (not webhook from ML service)?
+  Webhook requires ML service to know backend URL — tighter coupling.
+  Poller is simpler: backend controls retry logic, backoff, error handling.
+  Every 30s poll with Redis cache means frontend gets result within 30s of
+  ML completing, with zero load on ML service between polls.
+
+Why 7 DB tables and not more?
+  ml_verdicts.full_result (JSONB) absorbs all ML score detail.
+  If admin needs to filter by fraud_score or domain_score, top-level columns
+  (fraud_score, domain_score) are indexed; rest lives in JSONB.
+  Avoids a separate table per ML sub-score while keeping queries fast.
+
+Why chatbot integrated into backend (not separate service)?
+  Chatbot needs session state (application_id, skill, transcript) from backend DB.
+  Separating it adds a network hop and session sync complexity.
+  low_latency_chat_bot is a single-file FastAPI app — easy to integrate as module.
+  Can be extracted to its own service later if load requires it.
+
+Why separate Redis DB index (DB 2) for backend?
+  ML service uses DB 0 (Celery) and DB 1 (chunk buffer).
+  Backend uses DB 2 to avoid key collisions on shared Redis instance.
+  Same Redis host, fully isolated namespaces.
+
+================================================================================
+END OF PLAN
+================================================================================

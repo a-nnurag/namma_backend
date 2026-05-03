@@ -1,0 +1,41 @@
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.29.0
+alembic==1.13.3
+pgvector==0.3.2
+
+# Redis
+redis==5.1.1
+
+# Kafka
+aiokafka==0.11.0
+
+# Auth
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# Config
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# HTTP client (ML service, Aadhaar API, SarvamAI)
+httpx==0.27.2
+
+# OTP / SMS
+twilio==9.3.4
+
+# Face processing
+deepface==0.0.93
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+
+# Groq (LLM for chatbot)
+groq==0.11.0
+
+# Utilities
+python-dotenv==1.0.1
