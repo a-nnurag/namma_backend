@@ -54,8 +54,17 @@ class AIOKafkaProducerAdapter(KafkaProducerAdapter):
     start() / stop() are called by FastAPI lifespan events.
     """
 
-    def __init__(self, bootstrap_servers: str) -> None:
+    def __init__(
+        self,
+        bootstrap_servers: str,
+        use_ssl: bool = False,
+        sasl_username: str = "",
+        sasl_password: str = "",
+    ) -> None:
         self._bootstrap_servers = bootstrap_servers
+        self._use_ssl = use_ssl
+        self._sasl_username = sasl_username
+        self._sasl_password = sasl_password
         self._producer: Any = None  # aiokafka.AIOKafkaProducer
         self._connected = False
 
@@ -63,13 +72,23 @@ class AIOKafkaProducerAdapter(KafkaProducerAdapter):
         try:
             from aiokafka import AIOKafkaProducer  # type: ignore[import]
 
-            self._producer = AIOKafkaProducer(
+            kwargs: dict[str, Any] = dict(
                 bootstrap_servers=self._bootstrap_servers,
-                value_serializer=None,  # we handle serialization ourselves
+                value_serializer=None,
                 compression_type="gzip",
                 request_timeout_ms=30_000,
                 retry_backoff_ms=200,
             )
+            if self._use_ssl:
+                import ssl
+                kwargs.update(
+                    security_protocol="SASL_SSL",
+                    sasl_mechanism="SCRAM-SHA-256",
+                    sasl_plain_username=self._sasl_username,
+                    sasl_plain_password=self._sasl_password,
+                    ssl_context=ssl.create_default_context(),
+                )
+            self._producer = AIOKafkaProducer(**kwargs)
             await self._producer.start()
             self._connected = True
             log.info(
@@ -165,15 +184,15 @@ class MockKafkaProducerAdapter(KafkaProducerAdapter):
         self.messages.clear()
 
 
-def build_kafka_adapter(backend: str, bootstrap_servers: str) -> KafkaProducerAdapter:
-    """
-    Factory that builds a KafkaProducerAdapter based on the config value.
-
-    backend = "aiokafka" → AIOKafkaProducerAdapter
-    backend = "mock"     → MockKafkaProducerAdapter
-    """
+def build_kafka_adapter(
+    backend: str,
+    bootstrap_servers: str,
+    use_ssl: bool = False,
+    sasl_username: str = "",
+    sasl_password: str = "",
+) -> KafkaProducerAdapter:
     if backend == "mock":
         log.info("Using MockKafkaProducerAdapter (no real Kafka connection)")
         return MockKafkaProducerAdapter()
-    log.info("Using AIOKafkaProducerAdapter", bootstrap_servers=bootstrap_servers)
-    return AIOKafkaProducerAdapter(bootstrap_servers)
+    log.info("Using AIOKafkaProducerAdapter", bootstrap_servers=bootstrap_servers, ssl=use_ssl)
+    return AIOKafkaProducerAdapter(bootstrap_servers, use_ssl, sasl_username, sasl_password)

@@ -4,6 +4,8 @@ WORKDIR /app
 
 # Install system dependencies for OpenCV and DeepFace
 RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3-dev \
     libgl1 \
     libglib2.0-0 \
     libsm6 \

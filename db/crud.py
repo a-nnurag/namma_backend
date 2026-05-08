@@ -324,6 +324,33 @@ async def upsert_ml_verdict(
     return await db.create(verdict)
 
 
+# ── Sessions (explicit load helpers — avoid async lazy-load) ──────────────────
+
+async def get_sessions_for_application(
+    db: DatabaseAdapter, application_id: UUID
+) -> list[InterviewSession]:
+    return await db.list_by(InterviewSession, application_id=application_id)
+
+
+async def get_verdict_for_application(
+    db: DatabaseAdapter, application_id: UUID
+) -> MLVerdict | None:
+    return await db.get_by(MLVerdict, application_id=application_id)
+
+
+async def get_last_session_for_application(
+    db: DatabaseAdapter, application_id: UUID
+) -> InterviewSession | None:
+    stmt = (
+        select(InterviewSession)
+        .where(InterviewSession.application_id == application_id)
+        .order_by(InterviewSession.started_at.desc())
+        .limit(1)
+    )
+    result = await db.execute_query(stmt)
+    return result.scalars().first()
+
+
 # ── Admin ──────────────────────────────────────────────────────────────────────
 
 async def get_admin_by_phone(db: DatabaseAdapter, phone: str) -> AdminUser | None:

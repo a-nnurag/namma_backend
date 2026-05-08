@@ -62,6 +62,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     kafka_adapter = build_kafka_adapter(
         settings.KAFKA_ADAPTER_BACKEND,
         settings.KAFKA_BOOTSTRAP_SERVERS,
+        use_ssl=settings.KAFKA_USE_SSL,
+        sasl_username=settings.KAFKA_SASL_USERNAME,
+        sasl_password=settings.KAFKA_SASL_PASSWORD,
     )
     await kafka_adapter.start()
     set_producer(kafka_adapter)
@@ -116,13 +119,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — tighten for production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.allowed_origins_list,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
 
 

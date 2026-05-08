@@ -22,6 +22,7 @@ from db.crud import (
     get_application_by_id,
     get_documents_for_application,
     get_session_by_id,
+    get_skill_by_id,
     set_application_cooldown,
     update_application_status,
 )
@@ -151,8 +152,11 @@ async def end_interview(
     # Set 60-day cooldown immediately
     app = await set_application_cooldown(db, app)
 
+    # Fetch skill name explicitly — avoids async lazy-load on app.skill relationship
+    skill_obj = await get_skill_by_id(db, app.skill_id)
+    _skill_name = skill_obj.name if skill_obj else "unknown"
+
     # Check documents to set has_degree / has_workexp accurately
-    from db.crud import get_documents_for_application
     docs = await get_documents_for_application(db, str(app.id))
     doc_types = {d.doc_type for d in docs}
     has_degree  = "DEGREE" in doc_types
@@ -165,7 +169,7 @@ async def end_interview(
             candidate_id=user_id,
             session_id=session_id,
             application_id=str(app.id),
-            skill_name=app.skill.name if app.skill else "unknown",
+            skill_name=_skill_name,
             audio_buffer=buf.audio,
             video_buffer=buf.video,
             has_degree=has_degree,

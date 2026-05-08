@@ -16,7 +16,7 @@ from auth.middleware import get_registered_user
 from cache.redis_client import get_ml_status, subscribe_ml_result
 from core.logging import get_logger
 from db.adapter import DatabaseAdapter
-from db.crud import get_application_by_id
+from db.crud import get_application_by_id, get_verdict_for_application
 from db.session import get_db
 
 log = get_logger(__name__)
@@ -51,7 +51,7 @@ async def get_application_status(
     }
 
 
-@router.get("/application/status-stream/{application_id}")
+@router.get("/status-stream/{application_id}")
 async def stream_application_status(
     application_id: str,
     payload: Annotated[dict, Depends(get_registered_user)],
@@ -124,7 +124,7 @@ async def get_application_result(
             detail=f"Result not ready yet. Current status: {app.status}",
         )
 
-    verdict = app.verdict
+    verdict = await get_verdict_for_application(db, app.id)
     if verdict is None:
         raise HTTPException(status_code=404, detail="Verdict not found")
 

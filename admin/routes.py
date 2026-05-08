@@ -21,6 +21,8 @@ from db.crud import (
     get_application_by_id,
     get_applications_by_user,
     get_documents_for_application,
+    get_sessions_for_application,
+    get_verdict_for_application,
     get_session_by_id,
     get_user_by_id,
     list_candidates_paginated,
@@ -76,9 +78,10 @@ async def get_candidate_detail(
     applications_detail = []
     for app in apps:
         docs = await get_documents_for_application(db, app.id)
+
+        v = await get_verdict_for_application(db, app.id)
         verdict_data = None
-        if app.verdict:
-            v = app.verdict
+        if v:
             verdict_data = {
                 "verdict": v.verdict,
                 "composite_score": v.composite_score,
@@ -89,8 +92,9 @@ async def get_candidate_detail(
                 "skill_confidence": v.skill_confidence,
             }
 
+        app_sessions = await get_sessions_for_application(db, app.id)
         sessions = []
-        for sess in app.sessions:
+        for sess in app_sessions:
             sessions.append({
                 "session_id": str(sess.id),
                 "status": sess.status,

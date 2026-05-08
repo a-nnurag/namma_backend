@@ -18,6 +18,7 @@ from config import settings
 from core.logging import get_logger
 from db.crud import (
     deactivate_user,
+    get_last_session_for_application,
     get_processing_applications,
     get_user_by_id,
     update_application_status,
@@ -111,14 +112,17 @@ async def poll_once() -> None:
 
     log.info("Poller: checking applications", count=len(processing))
 
-    tasks = [
-        _process_one(
-            str(app.user_id),
-            str(app.id),
-            str(app.sessions[-1].id) if app.sessions else None,
+    # Load last session IDs explicitly — async session cannot lazy-load relationships
+    tasks = []
+    for app in processing:
+        last_session = await get_last_session_for_application(db, app.id)
+        tasks.append(
+            _process_one(
+                str(app.user_id),
+                str(app.id),
+                str(last_session.id) if last_session else None,
+            )
         )
-        for app in processing
-    ]
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
